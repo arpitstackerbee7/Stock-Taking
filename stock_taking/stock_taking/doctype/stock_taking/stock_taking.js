@@ -1,4 +1,3 @@
-
 frappe.ui.form.on("Stock Taking", {
 
     // =====================================================
@@ -11,22 +10,24 @@ frappe.ui.form.on("Stock Taking", {
 
         setTimeout(() => {
 
-            let field =
+            const field =
                 frm.fields_dict.scan_barcode;
 
             if (!field || !field.$input) {
                 return;
             }
 
-            field.$input.off("input");
+            field.$input.off(
+                "input.stock_taking"
+            );
 
             let scan_timer = null;
 
             field.$input.on(
-                "input",
+                "input.stock_taking",
                 function () {
 
-                    let value =
+                    const value =
                         field.$input
                             .val()
                             .trim();
@@ -112,6 +113,10 @@ frappe.ui.form.on("Stock Taking", {
             ""
         );
 
+        frm.clear_table(
+            "items"
+        );
+
         frm.refresh_field(
             "items"
         );
@@ -125,6 +130,8 @@ frappe.ui.form.on("Stock Taking", {
     // =====================================================
 
     warehouse(frm) {
+
+        update_child_warehouse(frm);
 
         frm.refresh_field(
             "items"
@@ -147,19 +154,22 @@ frappe.ui.form.on("Stock Taking", {
     // =====================================================
 
     before_submit(frm) {
-        // ---------------------------------------------------------
-        // DO NOT RUN ANY SERVER CALL HERE.
+
+        // IMPORTANT:
         //
-        // Stock analysis and Delivery Note creation are handled
-        // server-side in Stock Taking.on_submit().
+        // Do NOT call server-side processing here.
         //
-        // This prevents TimestampMismatchError caused by long
-        // async processing before the actual submit request.
-        // ---------------------------------------------------------
+        // Stock Taking.on_submit() handles:
+        //
+        // 1. Analysis
+        // 2. Return DN
+        // 3. Normal DN
+        //
+        // in background.
 
         frappe.validated = true;
     }
-    
+
 });
 
 
@@ -188,7 +198,6 @@ function show_stock_taking_loader(
             "stock-taking-submit-loader";
 
         loader.innerHTML = `
-
             <div class="stock-taking-loader-box">
 
                 <div class="stock-taking-spinner"></div>
@@ -217,6 +226,7 @@ function show_stock_taking_loader(
             #stock-taking-submit-loader {
 
                 position: fixed;
+
                 top: 0;
                 left: 0;
 
@@ -307,22 +317,24 @@ function show_stock_taking_loader(
         );
     }
 
-    let title_element =
+    const title_element =
         loader.querySelector(
             ".stock-taking-loader-title"
         );
 
-    let message_element =
+    const message_element =
         loader.querySelector(
             ".stock-taking-loader-message"
         );
 
     if (title_element) {
+
         title_element.textContent =
             title;
     }
 
     if (message_element) {
+
         message_element.textContent =
             message;
     }
@@ -341,7 +353,7 @@ function show_stock_taking_loader(
 
 function hide_stock_taking_loader() {
 
-    let loader =
+    const loader =
         document.getElementById(
             "stock-taking-submit-loader"
         );
@@ -358,890 +370,434 @@ function hide_stock_taking_loader() {
 
 
 // =========================================================
-// CREATE DELIVERY NOTE
-// =========================================================
-
-async function create_delivery_note(
-    frm,
-    items
-) {
-
-    if (
-        !items ||
-        !items.length
-    ) {
-        return;
-    }
-
-    // -----------------------------------------------------
-    // GET DEFAULT WAREHOUSE
-    // -----------------------------------------------------
-
-    let warehouses = [];
-
-    if (
-        Array.isArray(
-            frm.doc.warehouse
-        )
-    ) {
-
-        warehouses =
-            frm.doc.warehouse
-                .map(
-                    row =>
-                        row.warehuose ||
-                        row.warehouse
-                )
-                .filter(Boolean);
-
-    } else if (
-        typeof frm.doc.warehouse ===
-        "string"
-    ) {
-
-        warehouses =
-            frm.doc.warehouse
-                .split("\n")
-                .map(
-                    w => w.trim()
-                )
-                .filter(Boolean);
-    }
-
-    // -----------------------------------------------------
-    // FALLBACK
-    // -----------------------------------------------------
-
-    if (
-        !warehouses.length
-    ) {
-
-        warehouses =
-            (
-                frm.doc.items ||
-                []
-            )
-                .map(
-                    row =>
-                        row.warehouse
-                )
-                .filter(Boolean);
-    }
-
-    warehouses =
-        [
-            ...new Set(
-                warehouses
-            )
-        ];
-
-    if (
-        !warehouses.length
-    ) {
-
-        frappe.throw(
-            __(
-                "Please select at least one Warehouse."
-            )
-        );
-    }
-
-    let set_warehouse =
-        warehouses[0];
-
-
-    // =====================================================
-    // GROUP ITEMS
-    // =====================================================
-
-    let grouped = {};
-
-    for (
-        let row of items
-    ) {
-
-        if (!row.item_code) {
-            continue;
-        }
-
-        let warehouse =
-            row.warehouse ||
-            set_warehouse;
-
-        let key =
-            `${row.item_code}__${warehouse}`;
-
-        if (!grouped[key]) {
-
-            grouped[key] = {
-
-                item_code:
-                    row.item_code,
-
-                warehouse:
-                    warehouse,
-
-                qty: 0,
-
-                serials: []
-            };
-        }
-
-        grouped[key].qty +=
-            flt(
-                row.qty
-            );
-
-        if (
-            row.serial_no
-        ) {
-
-            grouped[key]
-                .serials.push(
-                    ...String(
-                        row.serial_no
-                    )
-                        .split("\n")
-                        .map(
-                            s => s.trim()
-                        )
-                        .filter(Boolean)
-                );
-        }
-    }
-
-
-    // =====================================================
-    // BUILD ITEMS
-    // =====================================================
-
-    let dn_items =
-        Object.values(
-            grouped
-        ).map(
-            row => ({
-
-                item_code:
-                    row.item_code,
-
-                qty:
-                    row.qty,
-
-                warehouse:
-                    row.warehouse,
-
-                serial_no:
-                    [
-                        ...new Set(
-                            row.serials
-                        )
-                    ].join("\n")
-            })
-        )
-        .filter(
-            row =>
-                flt(row.qty) > 0
-        );
-
-
-    if (
-        !dn_items.length
-    ) {
-        return;
-    }
-
-
-    // =====================================================
-    // DOCUMENT
-    // =====================================================
-
-    let dn_doc = {
-
-        doctype:
-            "Delivery Note",
-
-        company:
-            frm.doc.company,
-
-        set_warehouse:
-            set_warehouse,
-
-        custom_stock_taking:
-            frm.doc.name,
-
-        items:
-            dn_items
-    };
-
-
-    console.log(
-        "Optimized Delivery Note:",
-        dn_doc
-    );
-
-
-    // =====================================================
-    // API
-    // =====================================================
-
-    let response =
-        await frappe.call({
-
-            method:
-                "stock_taking.stock_taking.doctype.stock_taking.stock_taking.create_delivery_note",
-
-            args: {
-
-                doc:
-                    JSON.stringify(
-                        dn_doc
-                    )
-            },
-
-            freeze: true,
-
-            freeze_message:
-                __(
-                    "Creating Delivery Note..."
-                )
-        });
-
-
-    if (
-        response.message
-    ) {
-
-        frappe.show_alert({
-
-            message:
-                __(
-                    "Delivery Note {0} created successfully"
-                ).replace(
-                    "{0}",
-                    response.message.name
-                ),
-
-            indicator:
-                "green"
-        });
-    }
-}
-
-
-// =========================================================
-// CREATE RETURN DELIVERY NOTE
-// =========================================================
-
-async function create_delivery_note_return(
-    frm,
-    items
-) {
-
-    if (
-        !items ||
-        !items.length
-    ) {
-        return;
-    }
-
-
-    // =====================================================
-    // WAREHOUSE
-    // =====================================================
-
-    let warehouses = [];
-
-    if (
-        Array.isArray(
-            frm.doc.warehouse
-        )
-    ) {
-
-        warehouses =
-            frm.doc.warehouse
-                .map(
-                    row =>
-                        row.warehuose ||
-                        row.warehouse
-                )
-                .filter(Boolean);
-    }
-
-    if (
-        !warehouses.length
-    ) {
-
-        warehouses =
-            (
-                frm.doc.items ||
-                []
-            )
-                .map(
-                    row =>
-                        row.warehouse
-                )
-                .filter(Boolean);
-    }
-
-    warehouses =
-        [
-            ...new Set(
-                warehouses
-            )
-        ];
-
-    if (
-        !warehouses.length
-    ) {
-
-        frappe.throw(
-            __(
-                "Warehouse is required to create Delivery Note Return."
-            )
-        );
-    }
-
-
-    let default_warehouse =
-        warehouses[0];
-
-
-    // =====================================================
-    // GROUP
-    // =====================================================
-
-    let grouped = {};
-
-    items.forEach(
-        row => {
-
-            if (!row.item_code) {
-                return;
-            }
-
-            let warehouse =
-                row.warehouse ||
-                default_warehouse;
-
-            let key =
-                `${row.item_code}__${warehouse}`;
-
-            if (
-                !grouped[key]
-            ) {
-
-                grouped[key] = {
-
-                    item_code:
-                        row.item_code,
-
-                    warehouse:
-                        warehouse,
-
-                    qty: 0,
-
-                    serials: []
-                };
-            }
-
-            grouped[key].qty +=
-                flt(
-                    row.qty
-                );
-
-            if (
-                row.serial_no
-            ) {
-
-                grouped[key]
-                    .serials.push(
-                        ...String(
-                            row.serial_no
-                        )
-                            .split("\n")
-                            .map(
-                                s => s.trim()
-                            )
-                            .filter(Boolean)
-                    );
-            }
-        }
-    );
-
-
-    // =====================================================
-    // BUILD
-    // =====================================================
-
-    let dn_items =
-        Object.values(
-            grouped
-        )
-            .map(
-                row => {
-
-                    let item = {
-
-                        item_code:
-                            row.item_code,
-
-                        qty:
-                            row.qty,
-
-                        warehouse:
-                            row.warehouse
-                    };
-
-                    if (
-                        row.serials.length
-                    ) {
-
-                        item.serial_no =
-                            [
-                                ...new Set(
-                                    row.serials
-                                )
-                            ].join("\n");
-                    }
-
-                    return item;
-                }
-            )
-            .filter(
-                row =>
-                    flt(row.qty) > 0
-            );
-
-
-    if (
-        !dn_items.length
-    ) {
-        return;
-    }
-
-
-    // =====================================================
-    // DOCUMENT
-    // =====================================================
-
-    let dn_doc = {
-
-        doctype:
-            "Delivery Note",
-
-        is_return:
-            1,
-
-        company:
-            frm.doc.company,
-
-        set_warehouse:
-            default_warehouse,
-
-        custom_stock_taking:
-            frm.doc.name,
-
-        items:
-            dn_items
-    };
-
-
-    console.log(
-        "Optimized Return Delivery Note:",
-        dn_doc
-    );
-
-
-    // =====================================================
-    // API
-    // =====================================================
-
-    let response =
-        await frappe.call({
-
-            method:
-                "stock_taking.stock_taking.doctype.stock_taking.stock_taking.create_delivery_note_return",
-
-            args: {
-
-                doc:
-                    JSON.stringify(
-                        dn_doc
-                    )
-            },
-
-            freeze: true,
-
-            freeze_message:
-                __(
-                    "Creating Delivery Note Return..."
-                )
-        });
-
-
-    if (
-        !response.message
-    ) {
-
-        frappe.throw(
-            __(
-                "Failed to create Delivery Note Return."
-            )
-        );
-    }
-}
-
-
-// =========================================================
 // SERIAL SCAN
 // =========================================================
+function handle_serial_scan(frm, serial) {
 
-function handle_serial_scan(
-    frm,
-    serial
-) {
+    const selected_warehouses = (frm.doc.warehouse || [])
+        .map(row => row.warehuose || row.warehouse)
+        .filter(Boolean);
 
-    let is_active =
-        serial.status === "Active";
-
-    let parent_warehouse =
-        "";
-
-    if (
-        Array.isArray(
-            frm.doc.warehouse
-        ) &&
-        frm.doc.warehouse.length
-    ) {
-
-        parent_warehouse =
-            frm.doc.warehouse[0]
-                .warehuose ||
-            frm.doc.warehouse[0]
-                .warehouse ||
-            "";
+    if (!selected_warehouses.length) {
+        frappe.msgprint({
+            title: __("Warehouse Required"),
+            message: __("Please select at least one warehouse."),
+            indicator: "red"
+        });
+        return;
     }
 
+    const serial_name =
+        serial.name || "";
 
-    let warehouse =
-        is_active
-            ? (
-                serial.warehouse ||
-                parent_warehouse
-            )
-            : parent_warehouse;
+    const item_code =
+        serial.item_code || "";
 
+    const serial_warehouse =
+        serial.warehouse || "";
 
-    let row =
-        frm.doc.items.find(
-            d =>
-                d.item_code ===
-                    serial.item_code &&
-                d.warehouse ===
-                    warehouse &&
-                (
-                    (
-                        is_active &&
-                        !d.is_delivered_row
-                    ) ||
-                    (
-                        !is_active &&
-                        d.is_delivered_row
-                    )
-                )
+    const status =
+        serial.status || "";
+
+    if (!serial_name || !item_code) {
+        frappe.msgprint({
+            title: __("Invalid Serial"),
+            message: __("Serial Number information is incomplete."),
+            indicator: "red"
+        });
+        return;
+    }
+
+    const is_delivered =
+        status === "Delivered";
+
+    const in_selected_warehouse =
+        selected_warehouses.includes(
+            serial_warehouse
         );
 
+    const is_diff_warehouse =
+        !is_delivered &&
+        !in_selected_warehouse;
 
+    const parent_warehouse =
+        selected_warehouses[0];
+
+    // -----------------------------------------
+    // Find existing row
+    // -----------------------------------------
+    let row = frm.doc.items.find(d =>
+        d.item_code === item_code &&
+        d.warehouse === parent_warehouse
+    );
+
+    // -----------------------------------------
+    // New row
+    // -----------------------------------------
     if (!row) {
 
-        row =
-            frm.add_child(
-                "items"
-            );
+        row = frm.add_child("items");
 
-        row.item_code =
-            serial.item_code;
+        row.item_code = item_code;
+        row.warehouse = parent_warehouse;
 
-        row.warehouse =
-            warehouse;
+        row.serial_no = "";
+        row.inventory = 0;
+        row.physical_count = 0;
+        row.difference = 0;
 
-        row.serial_no =
-            "";
-
-        row.physical_count =
-            0;
-
-        row.is_delivered_row =
-            is_active
-                ? 0
-                : 1;
+        row.is_diff_warehouse_row = 0;
+        row.is_delivered_row = 0;
     }
 
+    // -----------------------------------------
+    // DELIVERED SERIAL
+    // -----------------------------------------
+    if (is_delivered) {
 
-    frappe.call({
+        row.item_code = item_code;
+        row.warehouse = parent_warehouse;
 
-        method:
-            "stock_taking.stock_taking.doctype.stock_taking.stock_taking.get_system_serials",
+        row.is_delivered_row = 1;
+        row.is_diff_warehouse_row = 0;
 
-        args: {
+        const existing_serials =
+            row.serial_no
+                ? String(row.serial_no)
+                    .split("\n")
+                    .map(x => x.trim())
+                    .filter(Boolean)
+                : [];
 
-            item_code:
-                serial.item_code,
-
-            warehouse:
-                warehouse
+        if (!existing_serials.includes(serial_name)) {
+            existing_serials.push(serial_name);
         }
 
-    }).then(
-        r => {
+        row.serial_no =
+            existing_serials.join("\n");
 
-            let system_serials =
-                r.message || [];
+        row.physical_count =
+            flt(row.physical_count || 0) + 1;
 
+        // Delivered row difference remains 0.
+        row.difference = 0;
 
-            if (is_active) {
+        frappe.msgprint({
+            title: __("Delivered Item"),
+            message: __(
+                "Item <b>{0}</b> is Delivered."
+            ).replace("{0}", item_code),
+            indicator: "orange"
+        });
+    }
 
-                row.inventory =
-                    system_serials.length;
+    // -----------------------------------------
+    // SERIAL FROM DIFFERENT WAREHOUSE
+    // -----------------------------------------
+    else if (is_diff_warehouse) {
 
-            } else {
+        row.item_code = item_code;
+        row.warehouse = parent_warehouse;
 
-                row.inventory =
-                    0;
-            }
+        row.is_diff_warehouse_row = 1;
+        row.is_delivered_row = 0;
 
+        const existing_serials =
+            row.serial_no
+                ? String(row.serial_no)
+                    .split("\n")
+                    .map(x => x.trim())
+                    .filter(Boolean)
+                : [];
 
-            let existing =
-                row.serial_no
-                    ? String(
-                        row.serial_no
-                    )
-                        .split("\n")
-                        .map(
-                            s => s.trim()
-                        )
-                        .filter(Boolean)
-                    : [];
-
-
-            if (
-                !existing.includes(
-                    serial.name
-                )
-            ) {
-
-                existing.push(
-                    serial.name
-                );
-            }
-
-
-            row.serial_no =
-                existing.join("\n");
-
-            row.physical_count =
-                existing.length;
-
-
-            frm.refresh_field(
-                "items"
-            );
-
-            update_total_quantity(
-                frm
-            );
+        if (!existing_serials.includes(serial_name)) {
+            existing_serials.push(serial_name);
         }
-    );
+
+        row.serial_no =
+            existing_serials.join("\n");
+
+        row.inventory = 0;
+
+        row.physical_count =
+            flt(row.physical_count || 0) + 1;
+
+        row.difference = 0;
+
+        frappe.msgprint({
+            title: __("Item Not Available"),
+            message: __(
+                "Item <b>{0}</b> is not available in warehouse <b>{1}</b>."
+            )
+                .replace("{0}", item_code)
+                .replace("{1}", parent_warehouse),
+            indicator: "orange"
+        });
+    }
+
+    // -----------------------------------------
+    // NORMAL ACTIVE SERIAL
+    // -----------------------------------------
+    else {
+
+        row.item_code = item_code;
+        row.warehouse = parent_warehouse;
+
+        row.is_diff_warehouse_row = 0;
+        row.is_delivered_row = 0;
+
+        const existing_serials =
+            row.serial_no
+                ? String(row.serial_no)
+                    .split("\n")
+                    .map(x => x.trim())
+                    .filter(Boolean)
+                : [];
+
+        if (!existing_serials.includes(serial_name)) {
+            existing_serials.push(serial_name);
+        }
+
+        row.serial_no =
+            existing_serials.join("\n");
+
+        row.physical_count =
+            flt(row.physical_count || 0) + 1;
+
+        row.difference =
+            flt(row.physical_count) -
+            flt(row.inventory);
+    }
+
+    frm.refresh_field("items");
+
+    update_total_quantity(frm);
+    calculate_differences(frm);
 }
-
-
 // =========================================================
 // PROCESS SCAN
 // =========================================================
-
-function process_scan(
-    frm,
-    scanned_code
-) {
-
-    if (
-        !frm.doc.stock_selection
-    ) {
-
-        frappe.msgprint({
-            title:
-                __("Mandatory"),
-
-            message:
-                __(
-                    "Please select Stock Location Type first"
-                ),
-
-            indicator:
-                "red"
-        });
-
-        return;
-    }
-
-
-    if (
-        !frm.doc.warehouse ||
-        !frm.doc.warehouse.length
-    ) {
-
-        frappe.msgprint({
-            title:
-                __("Mandatory"),
-
-            message:
-                __(
-                    "Please select Warehouse first"
-                ),
-
-            indicator:
-                "red"
-        });
-
-        return;
-    }
-
-
+function process_scan(frm, scanned_code) {
     if (!scanned_code) {
         return;
     }
 
+    if (!frm.doc.stock_selection) {
+        frappe.msgprint({
+            title: __("Stock Selection Required"),
+            message: __("Please select Stock Selection first."),
+            indicator: "red"
+        });
+        return;
+    }
 
-    let warehouse_list =
-        frm.doc.warehouse
-            .map(
-                w =>
-                    w.warehouse ||
-                    w.warehuose ||
-                    w
-            )
-            .filter(Boolean);
+    if (!frm.doc.warehouse || !frm.doc.warehouse.length) {
+        frappe.msgprint({
+            title: __("Warehouse Required"),
+            message: __("Please select at least one warehouse."),
+            indicator: "red"
+        });
+        return;
+    }
 
+    const selected_warehouses = (frm.doc.warehouse || [])
+        .map(row => row.warehuose || row.warehouse)
+        .filter(Boolean);
+
+    if (!selected_warehouses.length) {
+        frappe.msgprint({
+            title: __("Warehouse Required"),
+            message: __("Please select at least one warehouse."),
+            indicator: "red"
+        });
+        return;
+    }
 
     frappe.call({
-
-        method:
-            "stock_taking.stock_taking.doctype.stock_taking.stock_taking.scan_barcode",
-
+        method: "stock_taking.stock_taking.doctype.stock_taking.stock_taking.scan_barcode",
         args: {
+            code: scanned_code,
+            warehouses: selected_warehouses
+        },
 
-            code:
-                scanned_code,
+        callback: function (r) {
+            const res = r.message;
 
-            warehouses:
-                warehouse_list
-        }
-
-    }).then(
-        r => {
-
-            const res =
-                r.message;
-
-
-            if (
-                !res ||
-                !res.success
-            ) {
-
-                frappe.msgprint(
-                    res?.message ||
-                    "Invalid barcode"
-                );
-
+            if (!res || !res.success) {
+                frappe.msgprint({
+                    title: __("Scan Failed"),
+                    message: res?.message || __("Unable to process scan."),
+                    indicator: "red"
+                });
                 return;
             }
 
-
-            if (
-                res.type ===
-                "serial"
-            ) {
-
-                handle_serial_scan(
-                    frm,
-                    res.result
-                );
-
+            // =====================================================
+            // SERIAL NUMBER SCAN
+            // =====================================================
+            if (res.type === "serial") {
+                handle_serial_scan(frm, res.result);
                 return;
             }
 
+            // =====================================================
+            // NON-SERIALIZED ITEM SCAN
+            // =====================================================
+            if (res.type === "item") {
 
-            if (
-                res.type ===
-                "item"
-            ) {
+                const selected_warehouses = (frm.doc.warehouse || [])
+                    .map(row => row.warehuose || row.warehouse)
+                    .filter(Boolean);
 
-                (
-                    res.result ||
-                    []
-                ).forEach(
-                    bin => {
+                if (!selected_warehouses.length) {
+                    frappe.msgprint({
+                        title: __("Warehouse Required"),
+                        message: __("Please select at least one warehouse."),
+                        indicator: "red"
+                    });
+                    return;
+                }
 
-                        let row =
-                            frm.doc.items.find(
-                                d =>
-                                    d.item_code ===
-                                        bin.item_code &&
-                                    d.warehouse ===
-                                        bin.warehouse
-                            );
+                const parent_warehouse = selected_warehouses[0];
 
+                const bins = res.result || [];
 
-                        if (!row) {
+                bins.forEach(bin => {
 
-                            row =
-                                frm.add_child(
-                                    "items"
-                                );
+                    // Debug - temporary
+                    console.log("SCAN ITEM BIN:", bin);
 
-                            row.item_code =
-                                bin.item_code;
+                    const is_diff_warehouse =
+                        Number(bin.is_diff_warehouse_row || 0) === 1;
 
-                            row.warehouse =
-                                bin.warehouse;
+                    // =================================================
+                    // FIND EXISTING ROW
+                    // =================================================
+                    let row = frm.doc.items.find(d =>
+                        d.item_code === bin.item_code &&
+                        d.warehouse === parent_warehouse &&
+                        !d.is_delivered_row
+                    );
 
-                            row.serial_no =
-                                "";
+                    // =================================================
+                    // CREATE NEW ROW
+                    // =================================================
+                    if (!row) {
+                        row = frm.add_child("items");
 
-                            row.inventory =
-                                flt(
-                                    bin.actual_qty
-                                );
+                        // IMPORTANT:
+                        // Use frappe.model.set_value for Link fields
+                        frappe.model.set_value(
+                            row.doctype,
+                            row.name,
+                            "item_code",
+                            bin.item_code
+                        );
 
-                            row.physical_count =
-                                0;
-                        }
+                        frappe.model.set_value(
+                            row.doctype,
+                            row.name,
+                            "warehouse",
+                            parent_warehouse
+                        );
 
+                        row.serial_no = "";
+                        row.inventory = 0;
+                        row.physical_count = 0;
+                        row.difference = 0;
 
-                        row.physical_count =
-                            (
-                                flt(
-                                    row.physical_count
-                                ) ||
-                                0
-                            ) + 1;
+                        row.is_diff_warehouse_row = 0;
+                        row.is_delivered_row = 0;
                     }
-                );
 
+                    // =================================================
+                    // DIFFERENT WAREHOUSE ITEM
+                    // =================================================
+                    if (is_diff_warehouse) {
 
-                frm.refresh_field(
-                    "items"
-                );
+                        row.is_diff_warehouse_row = 1;
+                        row.is_delivered_row = 0;
 
-                update_total_quantity(
-                    frm
-                );
+                        // Selected warehouse me stock nahi hai
+                        row.inventory = 0;
+
+                        // Scan count
+                        row.physical_count =
+                            flt(row.physical_count) + 1;
+
+                        // Difference nahi banana
+                        row.difference = 0;
+
+                        // Alert
+                        frappe.msgprint({
+                            title: __("Item Not Available"),
+                            message: __(
+                                "Item <b>{0}</b> is not available in warehouse <b>{1}</b>."
+                            )
+                                .replace("{0}", bin.item_code)
+                                .replace("{1}", parent_warehouse),
+                            indicator: "orange"
+                        });
+
+                        return;
+                    }
+
+                    // =================================================
+                    // NORMAL NON-SERIALIZED ITEM
+                    // =================================================
+                    row.is_diff_warehouse_row = 0;
+                    row.is_delivered_row = 0;
+
+                    // Actual stock in selected warehouse
+                    row.inventory = flt(bin.actual_qty);
+
+                    // Scan count +1
+                    row.physical_count =
+                        flt(row.physical_count) + 1;
+
+                    // Difference
+                    row.difference =
+                        flt(row.physical_count) -
+                        flt(row.inventory);
+                });
+
+                // =====================================================
+                // REFRESH CHILD TABLE
+                // =====================================================
+                frm.refresh_field("items");
+
+                // =====================================================
+                // UPDATE TOTAL
+                // =====================================================
+                update_total_quantity(frm);
+
+                // =====================================================
+                // UPDATE DIFFERENCE
+                // =====================================================
+                calculate_differences(frm);
+
+                return;
             }
-        }
-    );
-}
 
+            // =====================================================
+            // UNKNOWN SCAN TYPE
+            // =====================================================
+            frappe.msgprint({
+                title: __("Invalid Scan"),
+                message: __("Unable to identify scanned item."),
+                indicator: "red"
+            });
+        },
+
+        error: function () {
+            frappe.msgprint({
+                title: __("Scan Failed"),
+                message: __("Unable to process the scan."),
+                indicator: "red"
+            });
+        }
+    });
+}
 
 // =========================================================
 // CHILD EVENTS
@@ -1251,20 +807,24 @@ frappe.ui.form.on(
     "Stock taking Items",
     {
 
-        physical_count(
-            frm
-        ) {
+        physical_count(frm) {
 
             update_total_quantity(
                 frm
             );
+
+            calculate_differences(
+                frm
+            );
         },
 
-        items_remove(
-            frm
-        ) {
+        items_remove(frm) {
 
             update_total_quantity(
+                frm
+            );
+
+            calculate_differences(
                 frm
             );
         }
@@ -1283,15 +843,13 @@ function update_total_quantity(
     let total = 0;
 
     (
-        frm.doc.items ||
-        []
+        frm.doc.items || []
     ).forEach(
         row => {
 
             total +=
                 flt(
-                    row.physical_count ||
-                    0
+                    row.physical_count || 0
                 );
         }
     );
@@ -1307,73 +865,44 @@ function update_total_quantity(
 // DIFFERENCE
 // =========================================================
 
-function calculate_differences(
-    frm
-) {
+function calculate_differences(frm) {
+    let changed = false;
 
-    let changed =
-        false;
+    (frm.doc.items || []).forEach(row => {
 
-    (
-        frm.doc.items ||
-        []
-    ).forEach(
-        row => {
-
-            if (
-                row.is_diff_warehouse_row
-            ) {
-
-                if (
-                    row.difference !== 0
-                ) {
-
-                    row.difference =
-                        0;
-
-                    changed =
-                        true;
-                }
-
-                return;
+        // Delivered item
+        if (row.is_delivered_row) {
+            if (row.difference !== 0) {
+                row.difference = 0;
+                changed = true;
             }
 
-
-            const inventory =
-                flt(
-                    row.inventory
-                ) || 0;
-
-            const physical =
-                flt(
-                    row.physical_count
-                ) || 0;
-
-            const diff =
-                physical -
-                inventory;
-
-
-            if (
-                row.difference !==
-                diff
-            ) {
-
-                row.difference =
-                    diff;
-
-                changed =
-                    true;
-            }
+            return;
         }
-    );
 
+        // Different warehouse item
+        if (row.is_diff_warehouse_row) {
+            if (row.difference !== 0) {
+                row.difference = 0;
+                changed = true;
+            }
+
+            return;
+        }
+
+        const inventory = flt(row.inventory) || 0;
+        const physical = flt(row.physical_count) || 0;
+
+        const diff = physical - inventory;
+
+        if (row.difference !== diff) {
+            row.difference = diff;
+            changed = true;
+        }
+    });
 
     if (changed) {
-
-        frm.refresh_field(
-            "items"
-        );
+        frm.refresh_field("items");
     }
 }
 
@@ -1393,24 +922,22 @@ function update_child_warehouse(
         return;
     }
 
-
     const parent_warehouse =
-        frm.doc.warehouse[0]
-            .warehuose ||
-        frm.doc.warehouse[0]
-            .warehouse;
-
+        frm.doc.warehouse[0].warehuose ||
+        frm.doc.warehouse[0].warehouse;
 
     if (!parent_warehouse) {
         return;
     }
 
-
     (
-        frm.doc.items ||
-        []
+        frm.doc.items || []
     ).forEach(
         row => {
+
+            // =================================================
+            // EXISTING DIFFERENT WAREHOUSE ROW
+            // =================================================
 
             if (
                 row.warehouse &&
@@ -1427,11 +954,9 @@ function update_child_warehouse(
         }
     );
 
-
     frm.refresh_field(
         "items"
     );
-
 
     calculate_differences(
         frm
@@ -1453,7 +978,6 @@ function get_warehouse_filter(
     const stock_selection =
         frm.doc.stock_selection;
 
-
     if (!company) {
 
         return {
@@ -1466,12 +990,10 @@ function get_warehouse_filter(
         };
     }
 
-
-    let filters = {
+    const filters = {
         company:
             company
     };
-
 
     if (
         stock_selection ===
@@ -1513,7 +1035,6 @@ function get_warehouse_filter(
             0;
     }
 
-
     return {
         filters:
             filters
@@ -1535,11 +1056,12 @@ function apply_warehouse_filter(
                 frm
             );
 
+    // =====================================================
+    // PARENT WAREHOUSE
+    // =====================================================
 
     if (
-        frm.fields_dict[
-            "warehouse"
-        ]
+        frm.fields_dict["warehouse"]
     ) {
 
         frm.set_query(
@@ -1548,18 +1070,18 @@ function apply_warehouse_filter(
         );
     }
 
+    // =====================================================
+    // CHILD TABLE WAREHOUSE
+    // =====================================================
 
     if (
-        frm.fields_dict[
-            "items"
-        ]
+        frm.fields_dict["items"]
     ) {
 
         const grid =
             frm.fields_dict[
                 "items"
             ].grid;
-
 
         [
             "warehouse",
@@ -1581,7 +1103,6 @@ function apply_warehouse_filter(
                 }
             }
         );
-
 
         grid.refresh();
     }
