@@ -190,23 +190,23 @@ def get_columns(filters=None):
         # OPENING
         # =================================================
 
-        {
-            "label": "Opening Qty",
-            "fieldname": "opening_qty",
-            "fieldtype": "Float",
-            "width": 120,
-        },
+        # {
+        #     "label": "Opening Qty",
+        #     "fieldname": "opening_qty",
+        #     "fieldtype": "Float",
+        #     "width": 120,
+        # },
 
         # =================================================
         # BALANCE
         # =================================================
 
-        {
-            "label": "Balance Qty",
-            "fieldname": "balance_qty",
-            "fieldtype": "Float",
-            "width": 120,
-        },
+        # {
+        #     "label": "Balance Qty",
+        #     "fieldname": "balance_qty",
+        #     "fieldtype": "Float",
+        #     "width": 120,
+        # },
 
         # =================================================
         # BOOK STOCK
