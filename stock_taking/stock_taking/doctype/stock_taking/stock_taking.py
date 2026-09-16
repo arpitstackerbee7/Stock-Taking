@@ -7,7 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import flt, cint, nowdate, getdate
+from frappe.utils import flt, cint, nowdate, getdate, now_datetime
 
 class StockTaking(Document):
 
@@ -41,16 +41,17 @@ class StockTaking(Document):
         if not self.company:
             frappe.throw(_("Company is mandatory."))
 
-        customer = get_stock_taking_customer(
-            self.company
-        )
+        customer = get_stock_taking_customer(self.company)
 
         if not customer:
             frappe.throw(
-                _(
-                    "Customer is not configured for Company {0} in Stock Taking Settings."
-                ).format(self.company)
-        )
+                _("Customer is not configured for Company {0} in Stock Taking Settings.").format(
+                    self.company
+                )
+            )
+
+        self.normal_dn_status = "Pending"
+        self.return_dn_status = "Pending"
 
 
     def on_submit(self, method=None):
@@ -223,21 +224,48 @@ def scan_barcode(code, warehouses=None):
 			"message": _("Unable to process scan."),
 		}
 
-
 def process_stock_taking(stock_taking_name):
 	"""
 	Main Stock Taking processing.
 
 	Flow:
-	1. Analyze stock.
-	2. Create Return DN first.
-	3. Create Normal DN second.
-	4. Both remain Draft.
-	5. Return DN gets linked to Normal DN after Normal DN submit.
+	1. Set both DN statuses to Process.
+	2. Analyze stock.
+	3. Create Return DN.
+	4. Update Return DN status.
+	5. Create Normal DN.
+	6. Update Normal DN status.
+	7. Commit both DNs together.
+	8. Notify browser after processing.
+
+	DN Status values:
+	- Pending
+	- Process
+	- Completed
+	- Failed
 	"""
 
+	# ---------------------------------------------------------
+	# INITIAL STATUS
+	# ---------------------------------------------------------
+
+	frappe.db.set_value(
+		"Stock Taking",
+		stock_taking_name,
+		{
+			"normal_dn_status": "Process",
+			"return_dn_status": "Process",
+		},
+		update_modified=False,
+	)
+
+	frappe.db.commit()
+
 	try:
-		st = frappe.get_doc("Stock Taking", stock_taking_name)
+		st = frappe.get_doc(
+			"Stock Taking",
+			stock_taking_name,
+		)
 
 		if st.docstatus != 1:
 			return
@@ -249,6 +277,10 @@ def process_stock_taking(stock_taking_name):
 				_("No warehouse found in Stock Taking.")
 			)
 
+		# ---------------------------------------------------------
+		# BUILD SCANNED DATA
+		# ---------------------------------------------------------
+
 		scanned_items = {}
 
 		for row in st.items or []:
@@ -258,11 +290,18 @@ def process_stock_taking(stock_taking_name):
 			if not item_code or not warehouse:
 				continue
 
-			physical_count = flt(row.physical_count or 0)
+			physical_count = flt(
+				row.physical_count or 0
+			)
 
-			serials = parse_serial_numbers(row.serial_no)
+			serials = parse_serial_numbers(
+				row.serial_no
+			)
 
-			key = (item_code, warehouse)
+			key = (
+				item_code,
+				warehouse,
+			)
 
 			if key not in scanned_items:
 				scanned_items[key] = {
@@ -277,7 +316,9 @@ def process_stock_taking(stock_taking_name):
 			scanned_items[key]["physical_count"] += physical_count
 
 			if serials:
-				scanned_items[key]["serials"].extend(serials)
+				scanned_items[key]["serials"].extend(
+					serials
+				)
 
 			if flt(row.is_diff_warehouse_row):
 				scanned_items[key]["is_diff_warehouse_row"] = 1
@@ -285,10 +326,15 @@ def process_stock_taking(stock_taking_name):
 			if flt(row.is_delivered_row):
 				scanned_items[key]["is_delivered_row"] = 1
 
+		# ---------------------------------------------------------
+		# ANALYZE
+		# ---------------------------------------------------------
+
 		all_issue_items = []
 		all_receipt_items = []
 
 		for warehouse in warehouse_data:
+
 			result = analyze_stock_taking(
 				stock_taking=st,
 				warehouse=warehouse,
@@ -303,75 +349,201 @@ def process_stock_taking(stock_taking_name):
 				result.get("receipt_items") or []
 			)
 
-		# Remove duplicate issue rows.
+		# ---------------------------------------------------------
+		# MERGE
+		# ---------------------------------------------------------
+
 		all_issue_items = merge_issue_items(
 			all_issue_items
 		)
 
-		# Remove duplicate receipt rows.
 		all_receipt_items = merge_receipt_items(
 			all_receipt_items
-		)
-
-		# ---------------------------------------------------------
-		# DEBUG LOG
-		# ---------------------------------------------------------
-		frappe.log_error(
-			frappe.as_json(
-				{
-					"stock_taking": stock_taking_name,
-					"issue_items_count": len(all_issue_items),
-					"receipt_items_count": len(all_receipt_items),
-					"issue_items": all_issue_items,
-					"receipt_items": all_receipt_items,
-				},
-				indent=2,
-			),
-			f"Stock Taking DN Debug - {stock_taking_name}",
 		)
 
 		return_dn = None
 		normal_dn = None
 
-		# ---------------------------------------------------------
-		# RETURN DN FIRST
-		# ---------------------------------------------------------
+		# =========================================================
+		# CREATE RETURN DN
+		# =========================================================
+
 		if all_receipt_items:
-			return_dn = create_delivery_note_return(
-				stock_taking=st,
-				items=all_receipt_items,
+
+			try:
+				return_dn = create_delivery_note_return(
+					stock_taking=st,
+					items=all_receipt_items,
+				)
+
+				if return_dn:
+					frappe.db.set_value(
+						"Stock Taking",
+						stock_taking_name,
+						"return_dn_status",
+						"Completed",
+						update_modified=False,
+					)
+
+				else:
+					frappe.db.set_value(
+						"Stock Taking",
+						stock_taking_name,
+						"return_dn_status",
+						"Failed",
+						update_modified=False,
+					)
+
+			except Exception:
+
+				frappe.db.set_value(
+					"Stock Taking",
+					stock_taking_name,
+					"return_dn_status",
+					"Failed",
+					update_modified=False,
+				)
+
+				frappe.log_error(
+					frappe.get_traceback(),
+					f"Return Delivery Note Creation Failed - {stock_taking_name}",
+				)
+
+		else:
+			# No Return DN required
+			frappe.db.set_value(
+				"Stock Taking",
+				stock_taking_name,
+				"return_dn_status",
+				"Completed",
+				update_modified=False,
+			)
+
+		# =========================================================
+		# CREATE NORMAL DN
+		# =========================================================
+
+		if all_issue_items:
+
+			try:
+				normal_dn = create_delivery_note(
+					stock_taking=st,
+					items=all_issue_items,
+				)
+
+				if normal_dn:
+					frappe.db.set_value(
+						"Stock Taking",
+						stock_taking_name,
+						"normal_dn_status",
+						"Completed",
+						update_modified=False,
+					)
+
+				else:
+					frappe.db.set_value(
+						"Stock Taking",
+						stock_taking_name,
+						"normal_dn_status",
+						"Failed",
+						update_modified=False,
+					)
+
+			except Exception:
+
+				frappe.db.set_value(
+					"Stock Taking",
+					stock_taking_name,
+					"normal_dn_status",
+					"Failed",
+					update_modified=False,
+				)
+
+				frappe.log_error(
+					frappe.get_traceback(),
+					f"Normal Delivery Note Creation Failed - {stock_taking_name}",
+				)
+
+		else:
+			# No Normal DN required
+			frappe.db.set_value(
+				"Stock Taking",
+				stock_taking_name,
+				"normal_dn_status",
+				"Completed",
+				update_modified=False,
 			)
 
 		# ---------------------------------------------------------
-		# NORMAL DN SECOND
+		# STANDALONE RETURN
+		#
+		# DO NOT AUTO SUBMIT
 		# ---------------------------------------------------------
-		if all_issue_items:
-			normal_dn = create_delivery_note(
-				stock_taking=st,
-				items=all_issue_items,
-			)
+
+		return_dn_submitted = False
+
+		# IMPORTANT:
+		# Return DN manually submit hoga.
+		#
+		# if return_dn and not normal_dn:
+		# 	return_dn.submit()
+		# 	return_dn_submitted = True
+
+		# ---------------------------------------------------------
+		# SINGLE COMMIT
+		#
+		# Both DNs + status updates commit together.
+		# ---------------------------------------------------------
 
 		frappe.db.commit()
 
+		# ---------------------------------------------------------
+		# COMPLETION EVENT
+		# ---------------------------------------------------------
+
+		event_data = {
+			"stock_taking": stock_taking_name,
+		}
+
+		if normal_dn:
+			event_data["delivery_note"] = normal_dn.name
+			event_data["delivery_note_status"] = "Draft"
+
+		if return_dn:
+			event_data["return_delivery_note"] = return_dn.name
+
+			if return_dn_submitted:
+				event_data["return_delivery_note_status"] = "Submitted"
+			else:
+				event_data["return_delivery_note_status"] = "Draft"
+
 		frappe.publish_realtime(
 			"stock_taking_complete",
-			{
-				"stock_taking": stock_taking_name,
-				"return_delivery_note": (
-					return_dn.name
-					if return_dn
-					else None
-				),
-				"delivery_note": (
-					normal_dn.name
-					if normal_dn
-					else None
-				),
-			},
+			event_data,
 		)
 
 	except Exception:
+
 		frappe.db.rollback()
+
+		# ---------------------------------------------------------
+		# OUTER FAILURE
+		#
+		# This handles failures before individual DN creation,
+		# such as analysis / warehouse / scanned data processing.
+		# ---------------------------------------------------------
+
+		frappe.db.set_value(
+			"Stock Taking",
+			stock_taking_name,
+			{
+				"normal_dn_status": "Failed",
+				"return_dn_status": "Failed",
+			},
+			update_modified=False,
+		)
+
+		frappe.db.commit()
 
 		frappe.log_error(
 			frappe.get_traceback(),
@@ -382,12 +554,13 @@ def process_stock_taking(stock_taking_name):
 			"stock_taking_failed",
 			{
 				"stock_taking": stock_taking_name,
-				"message": _("Stock Taking processing failed."),
+				"message": _(
+					"Stock Taking processing failed. Please check Error Log."
+				),
 			},
 		)
 
 		raise
-
 
 def get_stock_taking_warehouse_data(stock_taking):
 	"""
@@ -443,14 +616,28 @@ def analyze_stock_taking(
 	Serialized:
 	Active serials missing from scan = Issue.
 	Scanned serial not active in selected warehouse = Receipt.
+
+	Optimized:
+	Non-serialized Bin quantities are fetched in one query.
 	"""
 
 	issue_items = []
 	receipt_items = []
 
 	# ---------------------------------------------------------
+	# SCANNED DATA FOR THIS WAREHOUSE
+	# ---------------------------------------------------------
+
+	warehouse_scanned = {
+		key: value
+		for key, value in scanned_items.items()
+		if key[1] == warehouse
+	}
+
+	# ---------------------------------------------------------
 	# SYSTEM SERIALS
 	# ---------------------------------------------------------
+
 	system_serial_rows = frappe.get_all(
 		"Serial No",
 		filters={
@@ -473,20 +660,15 @@ def analyze_stock_taking(
 		).append(serial.name)
 
 	# ---------------------------------------------------------
-	# SCANNED DATA
-	# ---------------------------------------------------------
-	warehouse_scanned = {
-		key: value
-		for key, value in scanned_items.items()
-		if key[1] == warehouse
-	}
-
-	# ---------------------------------------------------------
 	# SERIALIZED ITEMS
 	# ---------------------------------------------------------
+
 	for item_code, system_serials in system_serials_by_item.items():
 
-		key = (item_code, warehouse)
+		key = (
+			item_code,
+			warehouse,
+		)
 
 		scanned_data = warehouse_scanned.get(
 			key,
@@ -497,9 +679,12 @@ def analyze_stock_taking(
 			scanned_data.get("serials") or []
 		)
 
-		# Missing system serials -> Issue DN
+		# System serial missing from physical scan
+		# => Issue DN
 		for serial_no in system_serials:
+
 			if serial_no not in scanned_serials:
+
 				issue_items.append(
 					{
 						"item_code": item_code,
@@ -512,6 +697,7 @@ def analyze_stock_taking(
 	# ---------------------------------------------------------
 	# SCANNED SERIALS
 	# ---------------------------------------------------------
+
 	for key, scanned_data in warehouse_scanned.items():
 
 		item_code, selected_warehouse = key
@@ -552,9 +738,10 @@ def analyze_stock_taking(
 				and serial_warehouse == selected_warehouse
 			)
 
-			# Delivered or serial from another warehouse
-			# => Receipt DN
+			# Delivered / another warehouse
+			# => Receipt
 			if not is_active_here:
+
 				receipt_items.append(
 					{
 						"item_code": item_code,
@@ -565,31 +752,77 @@ def analyze_stock_taking(
 				)
 
 	# ---------------------------------------------------------
-	# NON SERIALIZED ITEMS
+	# NON-SERIALIZED STOCK
+	#
+	# OPTIMIZED:
+	# One Bin query instead of one query per Item.
 	# ---------------------------------------------------------
-	non_serial_items = frappe.get_all(
-		"Item",
-		filters={
-			"has_serial_no": 0,
-			"disabled": 0,
-		},
-		pluck="name",
+
+	bin_rows = frappe.db.sql(
+		"""
+		SELECT
+			b.item_code,
+			b.actual_qty
+		FROM `tabBin` b
+		INNER JOIN `tabItem` i
+			ON i.name = b.item_code
+		WHERE
+			b.warehouse = %s
+			AND i.has_serial_no = 0
+			AND i.disabled = 0
+		""",
+		(warehouse,),
+		as_dict=True,
 	)
 
-	for item_code in non_serial_items:
+	system_qty_map = {}
 
-		bin_qty = frappe.db.get_value(
-			"Bin",
-			{
-				"item_code": item_code,
-				"warehouse": warehouse,
-			},
-			"actual_qty",
+	for row in bin_rows:
+
+		item_code = row.item_code
+
+		system_qty_map[item_code] = flt(
+			row.actual_qty or 0
 		)
 
-		bin_qty = flt(bin_qty or 0)
+	# ---------------------------------------------------------
+	# IMPORTANT:
+	# Only items with actual stock OR scanned physical count
+	# need comparison.
+	# ---------------------------------------------------------
 
-		key = (item_code, warehouse)
+	items_to_check = set(
+		system_qty_map.keys()
+	)
+
+	for key in warehouse_scanned:
+
+		item_code = key[0]
+
+		# Add only non-serialized items.
+		has_serial_no = frappe.db.get_value(
+			"Item",
+			item_code,
+			"has_serial_no",
+		)
+
+		if not has_serial_no:
+			items_to_check.add(item_code)
+
+	# ---------------------------------------------------------
+	# COMPARE NON-SERIALIZED
+	# ---------------------------------------------------------
+
+	for item_code in items_to_check:
+
+		bin_qty = flt(
+			system_qty_map.get(item_code) or 0
+		)
+
+		key = (
+			item_code,
+			warehouse,
+		)
 
 		scanned_data = warehouse_scanned.get(
 			key,
@@ -600,12 +833,16 @@ def analyze_stock_taking(
 			scanned_data.get("physical_count") or 0
 		)
 
-		# Do not create zero/zero DN.
+		# No difference
 		if bin_qty == physical_count:
 			continue
 
-		# System stock > Physical stock
+		# -----------------------------------------------------
+		# SYSTEM > PHYSICAL
+		# -----------------------------------------------------
+
 		if bin_qty > physical_count:
+
 			issue_items.append(
 				{
 					"item_code": item_code,
@@ -615,8 +852,12 @@ def analyze_stock_taking(
 				}
 			)
 
-		# Physical stock > System stock
+		# -----------------------------------------------------
+		# PHYSICAL > SYSTEM
+		# -----------------------------------------------------
+
 		elif physical_count > bin_qty:
+
 			receipt_items.append(
 				{
 					"item_code": item_code,
@@ -899,6 +1140,8 @@ def get_stock_taking_customer(company):
 
 	return customer
 
+
+
 def create_delivery_note(
 	stock_taking,
 	items,
@@ -908,8 +1151,8 @@ def create_delivery_note(
 	"""
 
 	customer = get_stock_taking_customer(
-        stock_taking.company
-    )
+		stock_taking.company
+	)
 
 	if not customer:
 		frappe.throw(
@@ -941,18 +1184,29 @@ def create_delivery_note(
 
 	dn = frappe.new_doc("Delivery Note")
 
+	# ---------------------------------------------------------
+	# DELIVERY NOTE HEADER
+	# ---------------------------------------------------------
+
 	dn.customer = customer
 	dn.company = company
 	dn.is_return = 0
 	dn.return_against = None
-	dn.posting_date = getdate() or nowdate()
+	dn.posting_date = getdate()
+	dn.posting_time = now_datetime().strftime("%H:%M:%S")
 	dn.set_posting_time = 1
 	dn.custom_stock_taking = stock_taking.name
 	dn.custom_abbr = abbr
 
+	# ---------------------------------------------------------
+	# ITEMS
+	# ---------------------------------------------------------
+
 	for row in items:
 
-		qty = flt(row.get("qty") or 0)
+		qty = flt(
+			row.get("qty") or 0
+		)
 
 		if qty <= 0:
 			continue
@@ -971,6 +1225,7 @@ def create_delivery_note(
 		dn_item.item_code = item_code
 		dn_item.warehouse = warehouse
 		dn_item.qty = abs(qty)
+
 		dn_item.uom = frappe.db.get_value(
 			"Item",
 			item_code,
@@ -1004,9 +1259,16 @@ def create_delivery_note(
 		if tax_template:
 			dn_item.item_tax_template = tax_template
 
-	# Nothing to insert
+	# ---------------------------------------------------------
+	# NOTHING TO INSERT
+	# ---------------------------------------------------------
+
 	if not dn.items:
 		return None
+
+	# ---------------------------------------------------------
+	# INSERT AS DRAFT
+	# ---------------------------------------------------------
 
 	dn.insert(
 		ignore_permissions=True,
@@ -1015,6 +1277,7 @@ def create_delivery_note(
 	)
 
 	return dn
+
 
 def create_delivery_note_return(
 	stock_taking,
@@ -1065,16 +1328,26 @@ def create_delivery_note_return(
 
 	dn = frappe.new_doc("Delivery Note")
 
+	# ---------------------------------------------------------
+	# RETURN DELIVERY NOTE HEADER
+	# ---------------------------------------------------------
+
 	dn.customer = customer
 	dn.company = company
 	dn.is_return = 1
 	dn.return_against = None
 	dn.posting_date = getdate()
+	dn.posting_time = now_datetime().strftime("%H:%M:%S")
 	dn.set_posting_time = 1
 	dn.custom_stock_taking = stock_taking.name
 	dn.custom_abbr = abbr
 
+	# ---------------------------------------------------------
+	# ITEMS
+	# ---------------------------------------------------------
+
 	for row in items:
+
 		qty = flt(
 			row.get("qty") or 0
 		)
@@ -1133,8 +1406,16 @@ def create_delivery_note_return(
 		if tax_template:
 			dn_item.item_tax_template = tax_template
 
+	# ---------------------------------------------------------
+	# NOTHING TO INSERT
+	# ---------------------------------------------------------
+
 	if not dn.items:
 		return None
+
+	# ---------------------------------------------------------
+	# INSERT AS DRAFT
+	# ---------------------------------------------------------
 
 	dn.insert(
 		ignore_permissions=True,
@@ -1146,17 +1427,36 @@ def create_delivery_note_return(
 
 def link_return_delivery_note(doc, method=None):
 	"""
-	After NORMAL Delivery Note is submitted,
-	link latest draft RETURN DN of same Stock Taking.
+	After NORMAL Delivery Note is submitted:
+
+	1. Find draft Return DN of same Stock Taking.
+	2. Set return_against = Normal DN.
+	3. Save Return DN.
+	4. Return DN remains Draft.
 	"""
+
+	if not doc:
+		return
+
+	# ---------------------------------------------------------
+	# RETURN DN PAR YE FUNCTION DOBARA NA CHALE
+	# ---------------------------------------------------------
 
 	if doc.is_return:
 		return
+
+	# ---------------------------------------------------------
+	# STOCK TAKING CHECK
+	# ---------------------------------------------------------
 
 	stock_taking = doc.get("custom_stock_taking")
 
 	if not stock_taking:
 		return
+
+	# ---------------------------------------------------------
+	# FIND DRAFT RETURN DN
+	# ---------------------------------------------------------
 
 	return_dn_name = frappe.db.get_value(
 		"Delivery Note",
@@ -1164,7 +1464,10 @@ def link_return_delivery_note(doc, method=None):
 			"custom_stock_taking": stock_taking,
 			"is_return": 1,
 			"docstatus": 0,
-			"return_against": ["is", "not set"],
+			"return_against": [
+				"is",
+				"not set",
+			],
 		},
 		"name",
 		order_by="creation desc",
@@ -1173,15 +1476,47 @@ def link_return_delivery_note(doc, method=None):
 	if not return_dn_name:
 		return
 
-	frappe.db.set_value(
+	# ---------------------------------------------------------
+	# LOAD RETURN DN
+	# ---------------------------------------------------------
+
+	return_dn = frappe.get_doc(
 		"Delivery Note",
 		return_dn_name,
-		"return_against",
-		doc.name,
-		update_modified=False,
+	)
+
+	if return_dn.docstatus != 0:
+		return
+
+	# ---------------------------------------------------------
+	# SET RETURN AGAINST
+	# ---------------------------------------------------------
+
+	return_dn.return_against = doc.name
+
+	# ---------------------------------------------------------
+	# SAVE ONLY
+	# RETURN DN SUBMIT NAHI HOGA
+	# ---------------------------------------------------------
+
+	return_dn.save(
+		ignore_permissions=True
 	)
 
 	frappe.clear_document_cache(
 		"Delivery Note",
-		return_dn_name,
+		return_dn.name,
+	)
+
+	# ---------------------------------------------------------
+	# REALTIME EVENT
+	# ---------------------------------------------------------
+
+	frappe.publish_realtime(
+		"stock_taking_return_linked",
+		{
+			"stock_taking": stock_taking,
+			"delivery_note": doc.name,
+			"return_delivery_note": return_dn.name,
+		},
 	)

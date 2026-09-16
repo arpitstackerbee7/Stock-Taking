@@ -11,6 +11,8 @@
   "company",
   "scan_barcode",
   "stock_reconciliation",
+  "normal_dn_status",
+  "return_dn_status",
   "column_break_neog",
   "stock_selection",
   "amended_from",
@@ -118,6 +120,18 @@
    "fieldtype": "Time",
    "label": "Plan Time",
    "read_only": 1
+  },
+  {
+   "fieldname": "normal_dn_status",
+   "fieldtype": "Data",
+   "label": "Normal DN Status",
+   "read_only": 1
+  },
+  {
+   "fieldname": "return_dn_status",
+   "fieldtype": "Data",
+   "label": "Return DN Status",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
@@ -129,7 +143,7 @@
    "link_fieldname": "custom_stock_taking"
   }
  ],
- "modified": "2026-09-12 09:57:33.373386",
+ "modified": "2026-09-16 09:21:03.607817",
  "modified_by": "Administrator",
  "module": "Stock Taking",
  "name": "Stock Taking",
