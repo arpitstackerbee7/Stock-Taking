@@ -155,20 +155,59 @@ frappe.ui.form.on("Stock Taking", {
 
     before_submit(frm) {
 
-        // IMPORTANT:
-        //
-        // Do NOT call server-side processing here.
-        //
-        // Stock Taking.on_submit() handles:
-        //
-        // 1. Analysis
-        // 2. Return DN
-        // 3. Normal DN
-        //
-        // in background.
-
         frappe.validated = true;
-    }
+
+        frappe.msgprint({
+            title: __(
+                "Stock Taking Submitted"
+            ),
+            message: `
+                <div style="line-height: 1.8;">
+
+                    <div>
+                        <b>Stock Taking has been submitted successfully.</b>
+                    </div>
+
+                    <div style="margin-top: 8px;">
+                        Delivery Note processing is running
+                        in the background.
+                    </div>
+
+                    <div style="margin-top: 8px; color: #6b7280;">
+                        You will receive a notification when
+                        the Delivery Note processing is completed.
+                    </div>
+
+                </div>
+            `,
+            indicator: "blue"
+        });
+    },
+
+    on_submit(frm) {
+		frappe.msgprint({
+			title: __("Stock Taking Submitted"),
+			message: `
+				<div style="font-size:14px; line-height:1.7;">
+					<p>
+						<b>${__("Stock Taking")}:</b>
+						${frappe.utils.escape_html(frm.doc.name)}
+					</p>
+
+					<p>
+						Delivery Notes are being created
+						<b>in the background</b>.
+					</p>
+
+					<p style="margin-bottom:0;">
+						Please wait. You will get another message
+						once the Delivery Notes are created.
+					</p>
+				</div>
+			`,
+			indicator: "blue",
+		});
+	},
 
 });
 
@@ -1106,4 +1145,262 @@ function apply_warehouse_filter(
 
         grid.refresh();
     }
+}
+
+
+// ============================================================
+// STOCK TAKING BACKGROUND PROCESSING - STARTED/COMPLETED
+// ============================================================
+
+if (frappe.realtime) {
+
+	frappe.realtime.off("stock_taking_complete");
+
+	frappe.realtime.on(
+		"stock_taking_complete",
+		function (data) {
+
+			if (!data || !data.stock_taking) {
+				return;
+			}
+
+			// Current form ke liye hi message show karo.
+			if (
+				typeof cur_frm === "undefined" ||
+				!cur_frm.doc ||
+				cur_frm.doc.name !== data.stock_taking
+			) {
+				return;
+			}
+
+			let rows = [];
+
+			if (data.delivery_note) {
+
+				rows.push(`
+					<tr>
+						<td style="padding:6px 12px 6px 0;">
+							<b>${__("Delivery Note")}</b>
+						</td>
+
+						<td style="padding:6px 0;">
+							<a href="/app/delivery-note/${encodeURIComponent(data.delivery_note)}"
+								target="_blank">
+								${frappe.utils.escape_html(data.delivery_note)}
+							</a>
+
+							<span class="indicator-pill yellow"
+								style="margin-left:8px;">
+								${__("Draft")}
+							</span>
+						</td>
+					</tr>
+				`);
+			}
+
+			if (data.return_delivery_note) {
+
+				let return_status =
+					data.return_delivery_note_status || "Draft";
+
+				let indicator =
+					return_status === "Submitted"
+						? "green"
+						: "yellow";
+
+				rows.push(`
+					<tr>
+						<td style="padding:6px 12px 6px 0;">
+							<b>${__("Return Delivery Note")}</b>
+						</td>
+
+						<td style="padding:6px 0;">
+							<a href="/app/delivery-note/${encodeURIComponent(data.return_delivery_note)}"
+								target="_blank">
+								${frappe.utils.escape_html(data.return_delivery_note)}
+							</a>
+
+							<span class="indicator-pill ${indicator}"
+								style="margin-left:8px;">
+								${frappe.utils.escape_html(return_status)}
+							</span>
+						</td>
+					</tr>
+				`);
+			}
+
+			if (!rows.length) {
+
+				rows.push(`
+					<tr>
+						<td colspan="2">
+							${__("No Delivery Note was required.")}
+						</td>
+					</tr>
+				`);
+			}
+
+			frappe.msgprint({
+				title: __("Stock Taking Processing Completed"),
+
+				message: `
+					<div style="font-size:14px;">
+
+						<p style="margin-bottom:12px;">
+							<b>${__("Stock Taking")}:</b>
+							${frappe.utils.escape_html(data.stock_taking)}
+						</p>
+
+						<p>
+							${__(
+								"Delivery Note processing has been completed."
+							)}
+						</p>
+
+						<table style="width:100%; margin-top:10px;">
+							<tbody>
+								${rows.join("")}
+							</tbody>
+						</table>
+
+						<p style="margin-top:14px; color:#666;">
+							${__(
+								"The documents have been created against this Stock Taking."
+							)}
+						</p>
+
+					</div>
+				`,
+
+				indicator: "green",
+
+				primary_action: {
+					label: __("Refresh"),
+
+					action() {
+						cur_frm.reload_doc();
+					},
+				},
+			});
+
+			// Form status refresh
+			if (
+				typeof cur_frm !== "undefined" &&
+				cur_frm.reload_doc
+			) {
+				cur_frm.reload_doc();
+			}
+		}
+	);
+
+
+	// ============================================================
+	// BACKGROUND PROCESSING FAILED
+	// ============================================================
+
+	frappe.realtime.off("stock_taking_failed");
+
+	frappe.realtime.on(
+		"stock_taking_failed",
+		function (data) {
+
+			if (!data || !data.stock_taking) {
+				return;
+			}
+
+			if (
+				typeof cur_frm === "undefined" ||
+				!cur_frm.doc ||
+				cur_frm.doc.name !== data.stock_taking
+			) {
+				return;
+			}
+
+			frappe.msgprint({
+				title: __("Stock Taking Processing Failed"),
+
+				message: `
+					<div style="font-size:14px;">
+						<p>
+							${__(
+								"Delivery Note creation failed while processing this Stock Taking."
+							)}
+						</p>
+
+						<p>
+							<b>${__("Stock Taking")}:</b>
+							${frappe.utils.escape_html(data.stock_taking)}
+						</p>
+
+						<p style="color:#888;">
+							${__(
+								"Please check Error Log for the detailed error."
+							)}
+						</p>
+					</div>
+				`,
+
+				indicator: "red",
+			});
+		}
+	);
+}
+
+if (frappe.realtime) {
+
+	frappe.realtime.off("stock_taking_return_submitted");
+
+	frappe.realtime.on(
+		"stock_taking_return_submitted",
+		function (data) {
+
+			if (!data || !data.stock_taking) {
+				return;
+			}
+
+			if (
+				typeof cur_frm === "undefined" ||
+				!cur_frm.doc ||
+				cur_frm.doc.name !== data.stock_taking
+			) {
+				return;
+			}
+
+			frappe.msgprint({
+				title: __("Return Delivery Note Submitted"),
+
+				message: `
+					<div style="font-size:14px; line-height:1.7;">
+
+						<p>
+							${__(
+								"Return Delivery Note has been linked with the Delivery Note and submitted automatically."
+							)}
+						</p>
+
+						<p>
+							<b>${__("Delivery Note")}:</b>
+							<a href="/app/delivery-note/${encodeURIComponent(data.delivery_note)}"
+								target="_blank">
+								${frappe.utils.escape_html(data.delivery_note)}
+							</a>
+						</p>
+
+						<p>
+							<b>${__("Return Delivery Note")}:</b>
+							<a href="/app/delivery-note/${encodeURIComponent(data.return_delivery_note)}"
+								target="_blank">
+								${frappe.utils.escape_html(data.return_delivery_note)}
+							</a>
+						</p>
+
+					</div>
+				`,
+
+				indicator: "green",
+			});
+
+			cur_frm.reload_doc();
+		}
+	);
 }
