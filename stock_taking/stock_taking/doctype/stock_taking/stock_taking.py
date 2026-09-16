@@ -1194,7 +1194,7 @@ def create_delivery_note(
 	dn.return_against = None
 	dn.posting_date = getdate()
 	dn.posting_time = now_datetime().strftime("%H:%M:%S")
-	dn.set_posting_time = 1
+	dn.set_posting_time = 0
 	dn.custom_stock_taking = stock_taking.name
 	dn.custom_abbr = abbr
 
@@ -1338,7 +1338,7 @@ def create_delivery_note_return(
 	dn.return_against = None
 	dn.posting_date = getdate()
 	dn.posting_time = now_datetime().strftime("%H:%M:%S")
-	dn.set_posting_time = 1
+	dn.set_posting_time = 0
 	dn.custom_stock_taking = stock_taking.name
 	dn.custom_abbr = abbr
 
