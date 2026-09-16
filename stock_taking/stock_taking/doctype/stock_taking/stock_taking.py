@@ -7,7 +7,8 @@ from decimal import Decimal, ROUND_HALF_UP
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import flt, cint, nowdate, getdate, now_datetime
+from datetime import timedelta
+from frappe.utils import flt, cint, nowdate, getdate, now_datetime,get_datetime
 
 class StockTaking(Document):
 
@@ -1194,7 +1195,7 @@ def create_delivery_note(
 	dn.return_against = None
 	dn.posting_date = getdate()
 	dn.posting_time = now_datetime().strftime("%H:%M:%S")
-	dn.set_posting_time = 1
+	dn.set_posting_time = 0
 	dn.custom_stock_taking = stock_taking.name
 	dn.custom_abbr = abbr
 
@@ -1425,49 +1426,39 @@ def create_delivery_note_return(
 
 	return dn
 
+
 def link_return_delivery_note(doc, method=None):
 	"""
 	After NORMAL Delivery Note is submitted:
 
 	1. Find draft Return DN of same Stock Taking.
-	2. Set return_against = Normal DN.
-	3. Save Return DN.
-	4. Return DN remains Draft.
+	2. Set Return DN posting timestamp after Normal DN.
+	3. Set return_against = Normal DN.
+	4. Save Return DN.
+	5. Return DN remains Draft.
 	"""
 
 	if not doc:
 		return
 
-	# ---------------------------------------------------------
-	# RETURN DN PAR YE FUNCTION DOBARA NA CHALE
-	# ---------------------------------------------------------
-
+	# Return DN par function dobara nahi chalega
 	if doc.is_return:
 		return
 
-	# ---------------------------------------------------------
-	# STOCK TAKING CHECK
-	# ---------------------------------------------------------
-
+	# Stock Taking related DN only
 	stock_taking = doc.get("custom_stock_taking")
 
 	if not stock_taking:
 		return
 
-	# ---------------------------------------------------------
-	# FIND DRAFT RETURN DN
-	# ---------------------------------------------------------
-
+	# Find draft Return DN
 	return_dn_name = frappe.db.get_value(
 		"Delivery Note",
 		{
 			"custom_stock_taking": stock_taking,
 			"is_return": 1,
 			"docstatus": 0,
-			"return_against": [
-				"is",
-				"not set",
-			],
+			"return_against": ["is", "not set"],
 		},
 		"name",
 		order_by="creation desc",
@@ -1475,10 +1466,6 @@ def link_return_delivery_note(doc, method=None):
 
 	if not return_dn_name:
 		return
-
-	# ---------------------------------------------------------
-	# LOAD RETURN DN
-	# ---------------------------------------------------------
 
 	return_dn = frappe.get_doc(
 		"Delivery Note",
@@ -1489,14 +1476,29 @@ def link_return_delivery_note(doc, method=None):
 		return
 
 	# ---------------------------------------------------------
-	# SET RETURN AGAINST
+	# IMPORTANT:
+	# Return DN timestamp must be AFTER Normal DN timestamp
+	# ---------------------------------------------------------
+
+	normal_dn_datetime = get_datetime(
+		f"{doc.posting_date} {doc.posting_time}"
+	)
+
+	return_dn_datetime = normal_dn_datetime + timedelta(seconds=1)
+
+	return_dn.posting_date = return_dn_datetime.date()
+	return_dn.posting_time = return_dn_datetime.strftime("%H:%M:%S.%f")
+	return_dn.set_posting_time = 1
+
+	# ---------------------------------------------------------
+	# Link Return DN with Normal DN
 	# ---------------------------------------------------------
 
 	return_dn.return_against = doc.name
 
 	# ---------------------------------------------------------
 	# SAVE ONLY
-	# RETURN DN SUBMIT NAHI HOGA
+	# Return DN submit nahi hoga
 	# ---------------------------------------------------------
 
 	return_dn.save(
@@ -1508,10 +1510,6 @@ def link_return_delivery_note(doc, method=None):
 		return_dn.name,
 	)
 
-	# ---------------------------------------------------------
-	# REALTIME EVENT
-	# ---------------------------------------------------------
-
 	frappe.publish_realtime(
 		"stock_taking_return_linked",
 		{
@@ -1520,3 +1518,24 @@ def link_return_delivery_note(doc, method=None):
 			"return_delivery_note": return_dn.name,
 		},
 	)
+ 
+def update_stock_taking_dn_timestamp(doc, method=None):
+	"""
+	Update posting timestamp immediately before submitting
+	Stock Taking related Delivery Note.
+	"""
+
+	if not doc:
+		return
+
+	if not doc.get("custom_stock_taking"):
+		return
+
+	if doc.docstatus != 0:
+		return
+
+	now = now_datetime()
+
+	doc.posting_date = now.date()
+	doc.posting_time = now.strftime("%H:%M:%S.%f")
+	doc.set_posting_time = 1
